@@ -156,7 +156,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if g_out.dim() >= 3 and g_out.size(0) == 1:
                     g_out = g_out[0]
 
-                if self.seppo_sequence and self.log_seq_grads_pass:
+                if self.seppo_sequence_2 and self.log_seq_grads_pass:
                     self.norms2_cache[mod] = (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
 
                 if self.seppo_sequence_2:
