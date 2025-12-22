@@ -166,7 +166,7 @@ class DataParallelPPOActor(BasePPOActor):
                         seq_norms = torch.sqrt(torch.sum(self.unflatten_attention_mask(token_norms2, self.attention_mask), dim=1))
                         scaling = torch.abs(self.seq_advantages) / (seq_norms + 1e-8)
                         scaling = self.flatten_response_window(scaling, self.attention_mask)
-                        return grad_input * scaling[:, None]
+                        return (grad_input[0] * scaling[:, None], None)
 
                 if self.seppo_parameter:
                     if self.seppo_sequence:
