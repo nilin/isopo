@@ -170,6 +170,8 @@ class DataParallelPPOActor(BasePPOActor):
                         scaling = torch.abs(self.seq_advantages) / (seq_norms + 1e-8)
                         scaling = self.flatten_response_window(scaling, self.attention_mask)
                         # For nn.Linear, grad_input is a single-element tuple: (dX,)
+                        print(f"scaling: {scaling.shape}")
+                        print(f"grad_input: {grad_input[0].shape}")
                         return (grad_input[0] * scaling[:, None],)
 
                 if self.seppo_parameter:
@@ -440,20 +442,20 @@ class DataParallelPPOActor(BasePPOActor):
             )
             pg_loss.backward()
 
-            norms2 = torch.stack(self.norms2_cache.values(), dim=0).sum(dim=0)
-            seq_norms2 = self.unflatten_attention_mask_to_list(norms2, model_inputs["attention_mask"])
-            self.norms2.append(seq_norms2)
-            self.seq_norms.append(torch.tensor([torch.sqrt(torch.sum(seq)) for seq in seq_norms2]))
+            #norms2 = torch.stack(self.norms2_cache.values(), dim=0).sum(dim=0)
+            #seq_norms2 = self.unflatten_attention_mask_to_list(norms2, model_inputs["attention_mask"])
+            #self.norms2.append(seq_norms2)
+            #self.seq_norms.append(torch.tensor([torch.sqrt(torch.sum(seq)) for seq in seq_norms2]))
 
             self.seq2_norms2_cache.append(self.norms2_cache)
 
-            if self.testing or True:
-                os.makedirs("dump", exist_ok=True)
-                with open(f"dump/seq_len_and_norms.txt", "a") as f:
-                    if mcb_idx == 0:
-                        f.write("\n")
-                    for seq,seqnorm in zip(seq_norms2,self.seq_norms[-1]):
-                        f.write(f"{len(seq)},{seqnorm.item():.6f}\n")
+            #if self.testing or True:
+            #    os.makedirs("dump", exist_ok=True)
+            #    with open(f"dump/seq_len_and_norms.txt", "a") as f:
+            #        if mcb_idx == 0:
+            #            f.write("\n")
+            #        for seq,seqnorm in zip(seq_norms2,self.seq_norms[-1]):
+            #            f.write(f"{len(seq)},{seqnorm.item():.6f}\n")
 
         self.actor_optimizer.zero_grad()
         self.log_seq_grads_pass = False
