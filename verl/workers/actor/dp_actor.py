@@ -160,13 +160,17 @@ class DataParallelPPOActor(BasePPOActor):
                     self.norms2_cache[mod] = (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
 
                 if self.seppo_sequence_2:
-                    #token_norms2 = (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
-                    if mod.prevmod is not None:
-                        token_norms2 = self.norms2_cache[mod.prevmod]
-                        seq_norms = torch.sqrt(torch.sum(self.unflatten_attention_mask(token_norms2, self.attention_mask), dim=1))
+                    # Token-wise scaling using previous Linear's cached norms.
+                    prev_mod = self._prevmod_map.get(mod, None)
+                    if prev_mod is not None and prev_mod in self.norms2_cache:
+                        token_norms2 = self.norms2_cache[prev_mod]
+                        seq_norms = torch.sqrt(
+                            torch.sum(self.unflatten_attention_mask(token_norms2, self.attention_mask), dim=1)
+                        )
                         scaling = torch.abs(self.seq_advantages) / (seq_norms + 1e-8)
                         scaling = self.flatten_response_window(scaling, self.attention_mask)
-                        return (grad_input[0] * scaling[:, None], None)
+                        # For nn.Linear, grad_input is a single-element tuple: (dX,)
+                        return (grad_input[0] * scaling[:, None],)
 
                 if self.seppo_parameter:
                     if self.seppo_sequence:
@@ -208,9 +212,12 @@ class DataParallelPPOActor(BasePPOActor):
                 lmod.register_forward_hook(_fwd_hook)
                 lmod.register_full_backward_hook(_bwd_hook)
 
+        # Keep a side map of previous module relationship to avoid registering
+        # a submodule attribute (which breaks weight loading/state_dict).
+        self._prevmod_map = {}
         prevmod = None
-        for i, (lname, lmod) in enumerate(self.linear_modules.items()):
-            lmod.prevmod = prevmod
+        for _, lmod in self.linear_modules.items():
+            self._prevmod_map[lmod] = prevmod
             prevmod = lmod
 
     def right_singular_rows(self, A: torch.Tensor, k: int, iterations: int = 3, skip_svd: bool = False) -> torch.Tensor:
@@ -348,12 +355,42 @@ class DataParallelPPOActor(BasePPOActor):
         return res
 
     def unflatten_attention_mask(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        res = torch.zeros(attention_mask.shape[0], x.shape[1], device=x.device, dtype=x.dtype)
-        for i in range(len(attention_mask)):
-            indices = (attention_mask[i] == 1)
-            res[i, indices] = x[:len(indices)]
-            x = x[len(indices):]
-        assert len(x) == 0, f"x has {len(x)} elements left over"
+        """Scatter a flattened per-token tensor back into padded [B, S(, D)].
+
+        Args:
+            x: Tensor of shape [N] or [N, D], containing only valid tokens (row-major flattened).
+            attention_mask: Bool/int Tensor of shape [B, S] with 1 for valid tokens.
+
+        Returns:
+            Tensor of shape [B, S] if x.ndim == 1, else [B, S, D], where tokens are
+            placed at positions where attention_mask==1 and zeros elsewhere.
+        """
+        B, S = attention_mask.shape
+        pos_mask = attention_mask.to(dtype=torch.bool, device=attention_mask.device)
+
+        if x.ndim == 1:
+            res = torch.zeros((B, S), device=x.device, dtype=x.dtype)
+        elif x.ndim == 2:
+            D = x.shape[1]
+            res = torch.zeros((B, S, D), device=x.device, dtype=x.dtype)
+        else:
+            raise ValueError(f"Unsupported x.ndim={x.ndim}; expected 1 or 2")
+
+        offset = 0
+        for i in range(B):
+            pos = pos_mask[i]
+            L = int(pos.sum().item())
+            if L == 0:
+                continue
+            if x.ndim == 1:
+                chunk = x[offset : offset + L]
+                res[i][pos] = chunk
+            else:
+                chunk = x[offset : offset + L, :]
+                res[i][pos] = chunk
+            offset += L
+
+        assert offset == x.shape[0], f"Consumed {offset} tokens, but x has {x.shape[0]}"
         return res
     
     # same as in the training loop, but without parameter updates and without advantages
