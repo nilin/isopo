@@ -161,11 +161,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if self.seppo_sequence_2:
                     #token_norms2 = (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
-                    token_norms2 = self.norms2_cache[mod.prevmod]
-                    seq_norms = torch.sqrt(torch.sum(self.unflatten_attention_mask(token_norms2, self.attention_mask), dim=1))
-                    scaling = torch.abs(self.seq_advantages) / (seq_norms + 1e-8)
-                    scaling = self.flatten_response_window(scaling, self.attention_mask)
-                    return grad_input * scaling[:, None]
+                    if mod.prevmod is not None:
+                        token_norms2 = self.norms2_cache[mod.prevmod]
+                        seq_norms = torch.sqrt(torch.sum(self.unflatten_attention_mask(token_norms2, self.attention_mask), dim=1))
+                        scaling = torch.abs(self.seq_advantages) / (seq_norms + 1e-8)
+                        scaling = self.flatten_response_window(scaling, self.attention_mask)
+                        return grad_input * scaling[:, None]
 
                 if self.seppo_parameter:
                     if self.seppo_sequence:
