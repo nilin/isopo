@@ -157,14 +157,15 @@ class DataParallelPPOActor(BasePPOActor):
                     g_out = g_out[0]
 
                 if self.seppo_sequence and self.log_seq_grads_pass:
-                    self.norms2_cache += (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
+                    self.norms2_cache[mod] = (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
 
                 if self.seppo_sequence_2:
-                    token_norms2 = (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
+                    #token_norms2 = (torch.norm(act_in, dim=1) * torch.norm(g_out, dim=1)).pow(2)
+                    token_norms2 = self.norms2_cache[mod.prevmod]
                     seq_norms = torch.sqrt(torch.sum(self.unflatten_attention_mask(token_norms2, self.attention_mask), dim=1))
                     scaling = torch.abs(self.seq_advantages) / (seq_norms + 1e-8)
                     scaling = self.flatten_response_window(scaling, self.attention_mask)
-                    return grad_output * scaling
+                    return grad_input * scaling[:, None]
 
                 if self.seppo_parameter:
                     if self.seppo_sequence:
@@ -205,6 +206,11 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 lmod.register_forward_hook(_fwd_hook)
                 lmod.register_full_backward_hook(_bwd_hook)
+
+        prevmod = None
+        for i, (lname, lmod) in enumerate(self.linear_modules.items()):
+            lmod.prevmod = prevmod
+            prevmod = lmod
 
     def right_singular_rows(self, A: torch.Tensor, k: int, iterations: int = 3, skip_svd: bool = False) -> torch.Tensor:
         A = A.to(dtype=torch.float32)
@@ -356,8 +362,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.seq_norms = []
         self.log_seq_grads_pass = True
 
+        self.seq2_norms2_cache = []
+
         for mcb_idx, micro_batch in enumerate(micro_batches):
-            self.norms2_cache = 0.0
+            self.norms2_cache = {}
 
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -394,9 +402,12 @@ class DataParallelPPOActor(BasePPOActor):
             )
             pg_loss.backward()
 
-            seq_norms2 = self.unflatten_attention_mask_to_list(self.norms2_cache, model_inputs["attention_mask"])
+            norms2 = torch.stack(self.norms2_cache.values(), dim=0).sum(dim=0)
+            seq_norms2 = self.unflatten_attention_mask_to_list(norms2, model_inputs["attention_mask"])
             self.norms2.append(seq_norms2)
             self.seq_norms.append(torch.tensor([torch.sqrt(torch.sum(seq)) for seq in seq_norms2]))
+
+            self.seq2_norms2_cache.append(self.norms2_cache)
 
             if self.testing or True:
                 os.makedirs("dump", exist_ok=True)
@@ -738,7 +749,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 ################################################################################
                 ## SEPPO SEQUENCE MODE: Precompute grad norms
-                if self.seppo and self.seppo_sequence:
+                if self.seppo and (self.seppo_sequence or self.seppo_sequence_2):
                     self.precompute_mcb_norms2(micro_batches, temperature, on_policy)
                 ################################################################################
 
@@ -779,6 +790,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                     ## SEPPO SEQUENCE MODE
                     if self.seppo and self.seppo_sequence_2:
+                        self.norms2_cache = self.seq2_norms2_cache[mcb_idx]
+
                         self.attention_mask = model_inputs["attention_mask"]
                         self.seq_advantages = model_inputs["advantages"][:, 0].to(self.attention_mask.device)
                     ################################################################################
