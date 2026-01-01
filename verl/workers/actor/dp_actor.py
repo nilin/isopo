@@ -23,7 +23,7 @@ import os
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -31,7 +31,6 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
-import torch.distributed as dist
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -39,8 +38,6 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-import functools
-import math
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -85,303 +82,6 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
-
-        #########################################################
-        # ISOPO hooks
-        #########################################################
-
-        self.isopo = self.config.get("use_isopo", False)
-        self.testing = self.config.get("isopo_testing", False)
-
-        self.isopo_norm_neg_power = self.config.get("isopo_norm_neg_power", 0.0)
-        self.isopo_overlap_neg_power = self.config.get("isopo_overlap_neg_power", 0.0)
-        self.isopo_rel_overlap_neg_power = self.config.get("isopo_rel_overlap_neg_power", 0.0)
-
-        self.isopo_rel_overlap_reg = self.config.get("isopo_rel_overlap_reg", 1.0)
-        self.isopo_overlap_reg = self.config.get("isopo_overlap_reg", 1.0)
-        self.isopo_norm_reg = self.config.get("isopo_norm_reg", 1.0)
-        self.isopo_nat_reg = self.config.get("isopo_nat_reg", 1.0)
-
-        self.override_pg_loss = self.config.get("override_pg_loss", False)
-        self.isopo_keep_small_invariant = self.config.get("isopo_keep_small_invariant", True)
-        self.isopo_nat = self.config.get("isopo_nat", False)
-
-        if self.isopo:
-            self.install_isopo_hooks()
-            self.reset_isopo_cache()
-            self.include_advantages_in_loss = False
-        else:
-            self.include_advantages_in_loss = True
-
-        print(f"self.actor_optimizer: {self.actor_optimizer}")
-        #import torch.optim as optim
-        #is_sgd = isinstance(self.actor_optimizer, optim.SGD) or self.actor_optimizer.__class__.__name__.lower() == "sgd"
-
-        self.done_tests = set()
-
-    #########################################################
-
-    def install_isopo_hooks(self):
-        """Install ISOPO hooks that
-        - store forward activations (act_in) per Linear layer
-        - compute a per-layer scalar from act_in and backward grad_out in a full backward hook
-        - use that scalar to scale the parameter gradients via param hooks
-
-        This is lightweight and safe under FSDP: scaling is applied on sharded grads.
-        """
-        self.linear_modules = {n: sub for n, sub in self.actor_module.named_modules() if isinstance(sub, nn.Linear)}
-
-        for i, (lname, lmod) in enumerate(self.linear_modules.items()):
-            # storage on module
-            lmod._isopo_act_in = None
-            lmod._isopo_scale = 1.0
-
-            # Forward hook to capture input activations
-            def _fwd_hook(mod, inputs, output):
-                in_tensor = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
-                try:
-                    mod._isopo_act_in = in_tensor.detach().clone()
-                except Exception:
-                    mod._isopo_act_in = None
-
-            # Full backward hook to compute a scalar using act_in and grad_out
-            def _bwd_hook(mod, grad_input, grad_output, dump=False, lname=None):
-                act_in = mod._isopo_act_in.clone()
-                _g_out = grad_output[0] if isinstance(grad_output, (tuple, list)) else grad_output
-                g_out = _g_out.clone()
-
-                act_in = act_in.to(dtype=torch.float32)
-                g_out = g_out.to(dtype=torch.float32)
-
-                # Explicitly remove a leading singleton (e.g., [1, T, D] -> [T, D])
-                if act_in.dim() >= 3 and act_in.size(0) == 1:
-                    act_in = act_in[0]
-                if g_out.dim() >= 3 and g_out.size(0) == 1:
-                    g_out = g_out[0]
-
-                # for overlap computation against a fixed set of samples
-                perm = torch.randperm(act_in.shape[0], device=act_in.device)
-                topk_idx = perm[:250]
-                a0 = act_in[topk_idx]
-                g0 = g_out[topk_idx]
-
-                act_in_seqs = self.unflatten_attention_mask_list(act_in, self.attention_mask)
-                g_out_seqs = self.unflatten_attention_mask_list(g_out, self.attention_mask)
-
-                if self.isopo_nat:
-                    seq_grads = []
-                    for i, (act_in_seq, g_out_seq) in enumerate(zip(act_in_seqs, g_out_seqs)):
-                        seq_grads.append(g_out_seq.T @ act_in_seq)
-
-                    ntk = torch.zeros((len(seq_grads), len(seq_grads)), dtype=torch.float32, device=seq_grads[0].device)
-                    for i in range(len(seq_grads)):
-                        for j in range(i, len(seq_grads)):
-                            ntk[i, j] = torch.sum(seq_grads[i] * seq_grads[j])
-                            ntk[j, i] = ntk[i, j]
-                    D, U = torch.linalg.eigh(ntk)
-                    reg = self.isopo_nat_reg * self.batch_stats(f"isopo_nat_reg_{lname}", torch.mean(D))
-                    preconditioner = reg / (D + reg + 1e-8)
-                    advantages_preconditioned = U @ (preconditioner * (U.T @ self.seq_advantages))
-
-                    grad = torch.stack(seq_grads, dim=-1) @ advantages_preconditioned
-
-                else:
-                    grad = 0.0
-                    for i, (act_in_seq, g_out_seq, advantage) in enumerate(zip(act_in_seqs, g_out_seqs, self.seq_advantages)):
-                        seq_grad = g_out_seq.T @ act_in_seq
-
-                        overlap = torch.norm(torch.sum((g0 @ seq_grad) * a0, dim=1)) / torch.norm(torch.norm(g0, dim=1) * torch.norm(a0, dim=1) + 1e-12)
-
-                        overlap_over_norm = overlap / (torch.norm(seq_grad) + 1e-12)
-
-                        p,q,r = self.isopo_norm_neg_power, self.isopo_overlap_neg_power, self.isopo_rel_overlap_neg_power
-
-                        assert not self.include_advantages_in_loss, "isopo to be used with separate_advantages"
-
-                        def add_reg_to_square(x, reg_factor, name, keep_small_invariant=self.isopo_keep_small_invariant):
-                            reg = reg_factor * self.batch_stats(f"{name}_squared_reg_{lname}", x.pow(2))
-                            if reg_factor == 0.0:
-                                keep_small_invariant = False
-
-                            if keep_small_invariant:
-                                return torch.sqrt(x.pow(2) / (reg + 1e-8) + 1.0)
-                            else:
-                                return torch.sqrt(x.pow(2) + reg)
-
-                        norm_w_reg = add_reg_to_square(torch.norm(seq_grad), self.isopo_norm_reg, "norm")
-                        overlap_w_reg = add_reg_to_square(overlap, self.isopo_overlap_reg, "overlap")
-                        rel_overlap_w_reg = add_reg_to_square(overlap_over_norm, self.isopo_rel_overlap_reg, "rel_overlap")
-
-                        scaling_factor = 1.0 / (norm_w_reg.pow(p) * overlap_w_reg.pow(q) * rel_overlap_w_reg.pow(r) + 1e-8)
-                        scaling = scaling_factor * advantage
-
-                        grad += scaling * seq_grad 
-
-                if hasattr(mod, "suppo_grad"):
-                    mod.suppo_grad += grad
-                else:
-                    mod.suppo_grad = grad
-
-
-            if self.testing and i in [8,16,32,64,128]:
-                lmod.register_forward_hook(_fwd_hook)
-                lmod.register_full_backward_hook(functools.partial(_bwd_hook, dump=True, lname=lname))
-            else:
-                lmod.register_forward_hook(_fwd_hook)
-                lmod.register_full_backward_hook(functools.partial(_bwd_hook, lname=lname))
-
-    def batch_stats(self, name: str, value: torch.Tensor) -> torch.Tensor:
-        if not hasattr(self, "done_batch_stats"):
-            self.done_batch_stats = {}
-        if not hasattr(self, "current_batch_stats"):
-            self.current_batch_stats = {}
-
-        if name not in self.current_batch_stats:
-            self.current_batch_stats[name] = []
-
-        self.current_batch_stats[name].append(value)
-        
-        if name in self.done_batch_stats:
-            return self.done_batch_stats[name]
-        else:
-            print(f"no batch history for {name}, returning value {value}")
-            return value
-
-    def update_batch_stats(self, ema_decay: float = 0.9):
-        for name, values in self.current_batch_stats.items():
-            current_value = torch.mean(torch.stack(values))
-            if name not in self.done_batch_stats:
-                self.done_batch_stats[name] = current_value
-            else:
-                self.done_batch_stats[name] = self.done_batch_stats[name] * ema_decay + current_value * (1 - ema_decay)
-
-    def reset_isopo_cache(self):
-        for lname, lmod in self.linear_modules.items():
-            try:
-                lmod.a_proj.clear()
-                lmod.g_proj.clear()
-            except Exception:
-                lmod.a_proj = []
-                lmod.g_proj = []
-
-    def flatten_attention_mask(self, x: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
-        """Flatten non-padding response tokens to (N, ...).
-
-        - Input `x` has shape `(B, R)` or `(B, R, H, ...)`.
-        - `response_mask` has shape `(B, R)` with 1/True for valid response tokens.
-        - Returns tensor with first two dims flattened to the valid rows only:
-          `(N,)` if `x` is 2D, or `(N, H, ...)` if `x` has more dims, where `N = response_mask.sum()`.
-        """
-        if x.dim() == 1:
-            x = x[:,None].expand_as(response_mask)
-        
-        assert x.dim() >= 2, "x must have at least 2 dims (B, R, ...)"
-        assert x.shape[0] == response_mask.shape[0] and x.shape[1] == response_mask.shape[1], (
-            f"x first two dims {x.shape[:2]} must match response_mask {response_mask.shape}"
-        )
-        # Ensure mask device matches x for boolean indexing
-        sel = response_mask.to(device=x.device).bool()
-        return x[sel]
-
-    def dt_local_global_slices(self, g: DTensor) -> tuple[slice, ...]:
-        """Return the global index slices that the local DTensor shard maps to.
-
-        This uses the DTensor's device mesh coordinates and placements to compute,
-        for each sharded dimension, the [start:end) range of the local shard in the
-        full (global) tensor. Replicated dimensions are returned as slice(None).
-
-        Notes:
-        - No collectives are issued. This is cheap and safe to call during training.
-        - Works with uneven splits (remainder distributed to lower ranks).
-        - If the DTensor has Partial placements, the slice still denotes the logical
-          region contributed by this rank, though values may be partially reduced.
-        """
-        assert isinstance(g, DTensor), "Expected a DTensor"
-
-        global_shape = tuple(g.shape)
-        mesh = g.device_mesh
-        coord = mesh.get_coordinate()
-
-        # Fallback: if no mesh coordinate (single-rank or not initialized), return full slices
-        if coord is None:
-            return tuple(slice(None) for _ in global_shape)
-
-        slices = [slice(None)] * len(global_shape)
-        for mesh_axis, placement in enumerate(g.placements):
-            if isinstance(placement, Shard):
-                dim = placement.dim
-                S = global_shape[dim]
-                world = mesh.size(mesh_axis)
-                i = coord[mesh_axis]
-                base = S // world
-                rem = S % world
-                start = i * base + min(i, rem)
-                length = base + (1 if i < rem else 0)
-                slices[dim] = slice(start, start + length)
-            elif isinstance(placement, Replicate):
-                # full dimension
-                continue
-            else:
-                # Partial or other placements: keep slice(None) to denote full logical dim
-                continue
-
-        return tuple(slices)
-
-    def dump_tensors(self, tensors, name="data"):
-        import numpy as np
-        from datetime import datetime
-        id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        os.makedirs(f"dump/{name}_{id}", exist_ok=True)
-        for key, value in tensors.items():
-            arr = value.detach().cpu().float().numpy()
-            np.save(f"dump/{name}_{id}/{key}.npy", arr)
-
-    #########################################################
-    # seqwise isopo
-    #########################################################
-
-    def test_flatten_unflatten(self, attention_mask: torch.Tensor):
-        if "test_flatten_unflatten" in self.done_tests:
-            return
-        self.done_tests.add("test_flatten_unflatten")
-
-        x = torch.randn(attention_mask.shape[0], attention_mask.shape[1], 5, device=attention_mask.device) * attention_mask[:,:,None]
-
-        flat_x = self.flatten_attention_mask(x, attention_mask)
-        unflat_x = self.unflatten_attention_mask(flat_x, attention_mask)
-        unflat_x_list = self.unflatten_attention_mask_list(flat_x, attention_mask)
-
-        self.dump_tensors({
-            f"attention_mask": attention_mask,
-            f"x": x,
-            f"flat_x": flat_x,
-            f"unflat_x": unflat_x,
-        }, name="test_flatten_unflatten")
-
-        assert torch.allclose(x, unflat_x)
-        for a, x, y in zip(attention_mask, x, unflat_x_list):
-            assert torch.allclose(x[a.bool()], y)
-
-        print("flatten and unflatten test passed")
-        return unflat_x
-
-    def unflatten_attention_mask(self, x_flat, attention_mask):
-        B, R = attention_mask.shape[:2]
-        m = attention_mask.view(B, R).to(x_flat.device).bool()
-        out = x_flat.new_zeros((B, R) + x_flat.shape[1:])
-        expected = int(m.sum().item())
-        assert x_flat.shape[0] == expected, f"flat len {x_flat.shape[0]} != mask sum {expected}"
-        out[m] = x_flat
-        return out
-
-    def unflatten_attention_mask_list(self, flat_x: torch.Tensor, attention_mask: torch.Tensor) -> list[torch.Tensor]:
-        res = []
-        unflat_x = self.unflatten_attention_mask(flat_x, attention_mask)
-        for row, a in zip(unflat_x, attention_mask):
-            res.append(row[a.bool()])
-        return res
-
-    #########################################################
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -482,8 +182,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    # Avoid in-place ops on views returned by custom Functions; use out-of-place scaling
-                    logits_rmpad = logits_rmpad / temperature
+                    logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -561,8 +260,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits = output.logits
-                    # Avoid in-place ops on views returned by custom Functions; use out-of-place scaling
-                    logits = logits / temperature
+
+                    logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
@@ -693,7 +392,6 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
-
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -705,7 +403,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for mcb_idx, micro_batch in enumerate(micro_batches):
+                for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -720,13 +418,6 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
-
-                    ################################################################################
-                    if self.isopo:
-                        self.attention_mask = attention_mask = model_inputs["attention_mask"]
-                        self.seq_advantages = advantages[:, 0].to(attention_mask.device)
-                        self.test_flatten_unflatten(attention_mask)
-                    ################################################################################
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
@@ -761,23 +452,17 @@ class DataParallelPPOActor(BasePPOActor):
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                    if self.override_pg_loss:
-                        if self.include_advantages_in_loss:
-                            pg_loss = agg_loss(loss_mat=-log_prob*advantages, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        else:
-                            pg_loss = agg_loss(loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                    else:
-                        # Compute policy loss (any function is expected to return 2 values)
-                        pg_loss, pg_metrics = policy_loss_fn(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages if self.include_advantages_in_loss else torch.ones_like(advantages),
-                            response_mask=response_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            config=self.config,
-                            rollout_is_weights=rollout_is_weights,
-                        )
-                        micro_batch_metrics.update(pg_metrics)
+                    # Compute policy loss (any function is expected to return 2 values)
+                    pg_loss, pg_metrics = policy_loss_fn(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=rollout_is_weights,
+                    )
+                    micro_batch_metrics.update(pg_metrics)
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -809,40 +494,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
-                    if self.testing:
-                        break
-
-                if self.isopo:
-                    for lname, lmod in self.linear_modules.items():
-                        for pname, p in lmod.named_parameters(recurse=False):
-                            dtg = p.grad
-                            if dtg is None:
-                                continue
-                            sl = self.dt_local_global_slices(dtg)
-
-                            if len(sl) != 2:
-                                with torch.no_grad():
-                                    dtg.mul_(0.0)
-                                print(f"WARN: rank {dist.get_rank()} {lname}.{pname} has {len(sl)} dimensions for shard mapping")
-                                continue
-
-                            # Work on local shard tensor; no collectives
-                            g_local = dtg.to_local()
-                            # Select matching per-row/col scalars and align dtype/device
-
-                            grad_transformed = 0.0 * g_local.clone() + lmod.suppo_grad
-                            lmod.suppo_grad = 0.0
-
-                            with torch.no_grad():
-                                g_local.copy_(grad_transformed)
-
-                    self.reset_isopo_cache()
-                    self.update_batch_stats()
-                ################################################################################
-
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
-
         self.actor_optimizer.zero_grad()
         return metrics
